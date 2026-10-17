@@ -1,0 +1,150 @@
+name: Build Rais APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Tên file ZIP muốn build (để trống = tự chọn ZIP mới nhất ở thư mục gốc)'
+        required: false
+        type: string
+        default: ''
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-android-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_RELEASE_KEY: ${{ secrets.RAIS_KEYSTORE_BASE64 != '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Install Gradle 8.7
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gradle-8.7/bin" >> "$GITHUB_PATH"
+
+      - name: Select ZIP project
+        id: select_zip
+        shell: bash
+        env:
+          REQUESTED_ZIP: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${REQUESTED_ZIP//[[:space:]]/}" ]]; then
+            ZIP_NAME="$REQUESTED_ZIP"
+            if [[ "$ZIP_NAME" == */* || "$ZIP_NAME" != *.zip ]]; then
+              echo "Enter only a ZIP file name in the repository root, e.g. Rais.zip"
+              exit 1
+            fi
+            if [[ ! -f "$ZIP_NAME" ]]; then
+              echo "ZIP file not found: $ZIP_NAME"
+              echo "ZIP files available:"
+              find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort || true
+              exit 1
+            fi
+          else
+            ZIP_NAME=""
+            LATEST_TIME=0
+            while IFS= read -r candidate; do
+              [[ -n "$candidate" ]] || continue
+              commit_time="$(git log -1 --format=%ct -- "$candidate" || true)"
+              [[ -n "$commit_time" ]] || commit_time=0
+              if (( commit_time > LATEST_TIME )); then
+                LATEST_TIME="$commit_time"
+                ZIP_NAME="$candidate"
+              fi
+            done < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n')
+            if [[ -z "$ZIP_NAME" ]]; then
+              echo "No ZIP files found in the repository root."
+              exit 1
+            fi
+          fi
+
+          echo "Selected ZIP: $ZIP_NAME"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip selected project
+        env:
+          ZIP_NAME: ${{ steps.select_zip.outputs.zip_name }}
+        run: |
+          set -euo pipefail
+          mkdir rais-project
+          unzip -q "$ZIP_NAME" -d rais-project
+
+          if [[ ! -f rais-project/settings.gradle && ! -f rais-project/settings.gradle.kts ]]; then
+            candidate="$(find rais-project -mindepth 2 -maxdepth 4 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+            if [[ -z "$candidate" ]]; then
+              echo "Could not find settings.gradle in selected ZIP; it must contain an Android Gradle project."
+              exit 1
+            fi
+            project_dir="$(dirname "$candidate")"
+            cp -a "$project_dir"/. rais-project/
+          fi
+
+          test -f rais-project/app/build.gradle -o -f rais-project/app/build.gradle.kts
+
+      - name: Configure persistent signing key
+        if: env.HAS_RELEASE_KEY == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RAIS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RAIS_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RAIS_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RAIS_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/rais-release.jks"
+          echo "RAIS_KEYSTORE_FILE=$RUNNER_TEMP/rais-release.jks" >> "$GITHUB_ENV"
+          echo "RAIS_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        if: env.HAS_RELEASE_KEY == 'true'
+        working-directory: rais-project
+        run: gradle assembleRelease --stacktrace
+
+      - name: Build debug APK (test only; configure release key for stable updates)
+        if: env.HAS_RELEASE_KEY != 'true'
+        working-directory: rais-project
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload signed release APK
+        if: env.HAS_RELEASE_KEY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rais-release-apk
+          path: rais-project/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload debug APK (test only)
+        if: env.HAS_RELEASE_KEY != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rais-debug-test-only
+          path: rais-project/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
