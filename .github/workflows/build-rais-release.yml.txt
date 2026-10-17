@@ -1,0 +1,110 @@
+name: Build Rais Thu Chi (Release APK + AAB)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-rais-release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      HAS_RELEASE_KEY: ${{ secrets.RAIS_KEYSTORE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "sdkmanager not found at $ANDROID_HOME/cmdline-tools"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Install Gradle 8.7
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gradle-8.7/bin" >> "$GITHUB_PATH"
+
+      - name: Find and extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_NAME=""
+          while IFS= read -r f; do
+            if unzip -Z1 "$f" | grep -Eq '(^|/)settings\.gradle(\.kts)?$'; then ZIP_NAME="$f"; fi
+          done < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+          [[ -n "$ZIP_NAME" ]] || { echo "Không tìm thấy ZIP dự án Android ở thư mục gốc."; exit 1; }
+          echo "Build project: $ZIP_NAME"
+          mkdir extracted rais-project
+          unzip -q "$ZIP_NAME" -d extracted
+          if [[ -f extracted/settings.gradle || -f extracted/settings.gradle.kts ]]; then
+            cp -a extracted/. rais-project/
+          else
+            SETTINGS="$(find extracted -mindepth 2 -maxdepth 5 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+            [[ -n "$SETTINGS" ]] || { echo "ZIP thiếu settings.gradle"; exit 1; }
+            cp -a "$(dirname "$SETTINGS")"/. rais-project/
+          fi
+          test -f rais-project/app/build.gradle -o -f rais-project/app/build.gradle.kts
+
+      - name: Require permanent release signing key
+        if: env.HAS_RELEASE_KEY != 'true'
+        run: |
+          echo "Thiếu GitHub Secret RAIS_KEYSTORE_BASE64. Không tạo bản release giả/không thể cập nhật; hãy cấu hình đủ 4 secrets theo README."
+          exit 1
+
+      - name: Configure release signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RAIS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RAIS_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RAIS_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RAIS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/rais-release.jks"
+          echo "RAIS_KEYSTORE_FILE=$RUNNER_TEMP/rais-release.jks" >> "$GITHUB_ENV"
+          echo "RAIS_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK and AAB
+        working-directory: rais-project
+        run: gradle clean assembleRelease bundleRelease --stacktrace
+
+      - name: Verify build outputs
+        working-directory: rais-project
+        run: |
+          set -euo pipefail
+          find app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) -print
+          test -f app/build/outputs/apk/release/app-release.apk
+          test -f app/build/outputs/bundle/release/app-release.aab
+
+      - name: Upload APK and AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rais-ThuChi-SIGNED-RELEASE
+          path: |
+            rais-project/app/build/outputs/apk/release/*.apk
+            rais-project/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+          retention-days: 30
