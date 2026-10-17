@@ -1,1 +1,87 @@
 
+name: Build Rais APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'Rais.zip'
+      - '.github/workflows/build-android-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_RELEASE_KEY: ${{ secrets.RAIS_KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Install Gradle 8.7
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gradle-8.7/bin" >> "$GITHUB_PATH"
+
+      - name: Unzip Rais project
+        run: |
+          test -f Rais.zip
+          mkdir rais-project
+          unzip -q Rais.zip -d rais-project
+          test -f rais-project/settings.gradle
+          test -f rais-project/app/build.gradle
+
+      - name: Configure persistent signing key
+        if: env.HAS_RELEASE_KEY == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RAIS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RAIS_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RAIS_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RAIS_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/rais-release.jks"
+          echo "RAIS_KEYSTORE_FILE=$RUNNER_TEMP/rais-release.jks" >> "$GITHUB_ENV"
+          echo "RAIS_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK (recommended for updates)
+        if: env.HAS_RELEASE_KEY == 'true'
+        working-directory: rais-project
+        run: gradle assembleRelease --stacktrace
+
+      - name: Build debug APK (test only; not reliable for future updates)
+        if: env.HAS_RELEASE_KEY != 'true'
+        working-directory: rais-project
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload signed release APK
+        if: env.HAS_RELEASE_KEY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rais-0.0.1-release-apk
+          path: rais-project/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload debug APK (test only)
+        if: env.HAS_RELEASE_KEY != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rais-debug-test-only
+          path: rais-project/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
