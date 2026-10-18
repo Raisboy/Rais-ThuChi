@@ -1,0 +1,104 @@
+name: Build Rais Wallet (Release APK + AAB)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-rais-wallet.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+          if [[ -z "$SDKMANAGER" ]]; then echo "sdkmanager not found"; exit 1; fi
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      - name: Install Gradle 8.7
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gradle-8.7/bin" >> "$GITHUB_PATH"
+      - name: Select newest project ZIP from repository root
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_NAME=""
+          ZIP_TIME=-1
+          while IFS= read -r candidate; do
+            [[ -n "$candidate" ]] || continue
+            t="$(git log -1 --format=%ct -- "$candidate" || true)"
+            [[ -n "$t" ]] || t=0
+            if (( t >= ZIP_TIME )); then ZIP_TIME="$t"; ZIP_NAME="$candidate"; fi
+          done < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+          [[ -n "$ZIP_NAME" ]] || { echo "No ZIP project found in repository root"; exit 1; }
+          echo "Selected project: $ZIP_NAME"
+          echo "name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+      - name: Extract Android project
+        env:
+          ZIP_NAME: ${{ steps.zip.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir rais-project
+          unzip -q "$ZIP_NAME" -d rais-project
+          SETTINGS="$(find rais-project \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+          [[ -n "$SETTINGS" ]] || { echo "settings.gradle not found in ZIP"; exit 1; }
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          [[ -f "$PROJECT_DIR/app/build.gradle" || -f "$PROJECT_DIR/app/build.gradle.kts" ]] || { echo "app Gradle file not found"; exit 1; }
+      - name: Validate signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RAIS_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RAIS_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RAIS_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RAIS_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$KEYSTORE_BASE64" && -n "$KEYSTORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]] || { echo "Configure all 4 RAIS signing secrets"; exit 1; }
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/rais-release.jks"
+          test -s "$RUNNER_TEMP/rais-release.jks"
+          echo "RAIS_KEYSTORE_FILE=$RUNNER_TEMP/rais-release.jks" >> "$GITHUB_ENV"
+          echo "RAIS_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "RAIS_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+      - name: Build signed APK and AAB
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon -p "$PROJECT_DIR" clean assembleRelease bundleRelease --stacktrace
+      - name: Verify outputs
+        run: |
+          set -euo pipefail
+          APK="$(find rais-project -path '*/build/outputs/apk/release/*.apk' -type f -print -quit)"
+          AAB="$(find rais-project -path '*/build/outputs/bundle/release/*.aab' -type f -print -quit)"
+          [[ -s "$APK" ]] || { echo "Release APK missing"; exit 1; }
+          [[ -s "$AAB" ]] || { echo "Release AAB missing"; exit 1; }
+          mkdir -p release-files
+          cp "$APK" release-files/Rais-Wallet-release.apk
+          cp "$AAB" release-files/Rais-Wallet-release.aab
+          ls -lh release-files
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rais-Wallet-SIGNED-RELEASE
+          path: release-files/*
+          if-no-files-found: error
+          retention-days: 30
